@@ -191,18 +191,30 @@ impl StablecoinDEX {
         Ok(())
     }
 
-    /// Decrement user's internal balance or transfer from external wallet
+    /// Decrement user's internal balance or transfer from external wallet.
+    ///
+    /// When `check_pause` is true and the full amount is covered by internal balance,
+    /// verifies the token is not paused (T4+). Callers that already check pause state
+    /// (e.g. swaps via `validate_and_build_route`) should pass `false` to avoid a
+    /// redundant SLOAD.
     fn decrement_balance_or_transfer_from(
         &mut self,
         user: Address,
         token: Address,
         amount: u128,
+        check_pause: bool,
     ) -> Result<()> {
         // Ensure that the token can be transferred
-        TIP20Token::from_address(token)?.ensure_transfer_authorized(user, self.address)?;
+        let tip20 = TIP20Token::from_address(token)?;
+        tip20.ensure_transfer_authorized(user, self.address)?;
 
         let user_balance = self.balance_of(user, token)?;
         if user_balance >= amount {
+            // When fully covered by internal balance, TIP-20 transferFrom won't run,
+            // so we must check the pause state ourselves (spec: T4+).
+            if check_pause && self.storage.spec().is_t4() {
+                tip20.check_not_paused()?;
+            }
             self.sub_balance(user, token, amount)
         } else {
             let remaining = amount
@@ -287,7 +299,8 @@ impl StablecoinDEX {
         let route = self.find_trade_path(token_in, token_out)?;
 
         // Deduct input tokens from sender (only once, at the start)
-        self.decrement_balance_or_transfer_from(sender, token_in, amount_in)?;
+        // Pause already checked in validate_and_build_route
+        self.decrement_balance_or_transfer_from(sender, token_in, amount_in, false)?;
 
         // Execute swaps for each hop - intermediate balances are transitory
         let mut amount = amount_in;
@@ -337,7 +350,8 @@ impl StablecoinDEX {
         }
 
         // Deduct input tokens ONCE at end
-        self.decrement_balance_or_transfer_from(sender, token_in, amount)?;
+        // Pause already checked in validate_and_build_route
+        self.decrement_balance_or_transfer_from(sender, token_in, amount, false)?;
 
         // Transfer only final output ONCE at end
         self.transfer(token_out, sender, amount_out)?;
@@ -495,11 +509,18 @@ impl StablecoinDEX {
 
         // Check policy on non-escrow token (escrow token is checked in decrement_balance_or_transfer_from)
         // Direction: DEX → sender (order placer receives non-escrow token when filled)
-        TIP20Token::from_address(non_escrow_token)?
-            .ensure_transfer_authorized(self.address, sender)?;
+        let non_escrow_tip20 = TIP20Token::from_address(non_escrow_token)?;
+        non_escrow_tip20.ensure_transfer_authorized(self.address, sender)?;
+
+        // On T4+, reject if the non-escrow token is paused. When this order fills, the
+        // non-escrow token may be moved via internal-balance updates that bypass TIP-20's
+        // pause check, so we enforce it at placement.
+        if self.storage.spec().is_t4() {
+            non_escrow_tip20.check_not_paused()?;
+        }
 
         // Debit from user's balance or transfer from wallet
-        self.decrement_balance_or_transfer_from(sender, escrow_token, escrow_amount)?;
+        self.decrement_balance_or_transfer_from(sender, escrow_token, escrow_amount, true)?;
 
         // Create the order
         let order_id = self.next_order_id()?;
@@ -664,21 +685,33 @@ impl StablecoinDEX {
 
         // Check policy on non-escrow token (escrow token is checked in decrement_balance_or_transfer_from or below)
         // Direction: DEX → sender (order placer receives non-escrow token when filled)
-        TIP20Token::from_address(non_escrow_token)?
-            .ensure_transfer_authorized(self.address, sender)?;
+        let non_escrow_tip20 = TIP20Token::from_address(non_escrow_token)?;
+        non_escrow_tip20.ensure_transfer_authorized(self.address, sender)?;
+
+        // On T4+, reject if the non-escrow token is paused. When this order fills, the
+        // non-escrow token may be moved via internal-balance updates that bypass TIP-20's
+        // pause check, so we enforce it at placement.
+        if self.storage.spec().is_t4() {
+            non_escrow_tip20.check_not_paused()?;
+        }
 
         // Debit from user's balance only. This is set to true after a flip order is filled and the
         // subsequent flip order is being placed.
         if internal_balance_only {
-            TIP20Token::from_address(escrow_token)?
-                .ensure_transfer_authorized(sender, self.address)?;
+            let tip20 = TIP20Token::from_address(escrow_token)?;
+            tip20.ensure_transfer_authorized(sender, self.address)?;
+            // Internal-balance-only path bypasses TIP-20 transferFrom,
+            // so we must check the pause state ourselves (spec: T4+).
+            if self.storage.spec().is_t4() {
+                tip20.check_not_paused()?;
+            }
             let user_balance = self.balance_of(sender, escrow_token)?;
             if user_balance < escrow_amount {
                 return Err(StablecoinDEXError::insufficient_balance().into());
             }
             self.sub_balance(sender, escrow_token, escrow_amount)?;
         } else {
-            self.decrement_balance_or_transfer_from(sender, escrow_token, escrow_amount)?;
+            self.decrement_balance_or_transfer_from(sender, escrow_token, escrow_amount, true)?;
         }
 
         // Create the flip order
@@ -5489,6 +5522,183 @@ mod tests {
             })?;
         }
         Ok(())
+    }
+
+    /// Shared helper for paused-token order placement tests across T3 (no enforcement) and T4
+    /// (rejection). Pauses either the escrow or non-escrow side of the pair and asserts whether
+    /// `place_order` succeeds based on the pause side, internal balance, and active hardfork.
+    fn assert_paused_token_order<F>(
+        pause_escrow_side: bool,
+        internal_balance_amount: u128,
+        is_bid: bool,
+        mut place_order: F,
+    ) -> eyre::Result<()>
+    where
+        F: FnMut(&mut StablecoinDEX, Address, Address, u128) -> Result<u128>,
+    {
+        for spec in [TempoHardfork::T3, TempoHardfork::T4] {
+            let mut storage = HashMapStorageProvider::new_with_spec(1, spec);
+            StorageCtx::enter(&mut storage, || {
+                let mut exchange = StablecoinDEX::new();
+                exchange.initialize()?;
+
+                let (alice, admin) = (Address::random(), Address::random());
+                let amount = MIN_ORDER_AMOUNT;
+
+                let (base_token, quote_token) =
+                    setup_test_tokens(admin, alice, exchange.address, 500_000_000u128)?;
+                exchange.create_pair(base_token)?;
+
+                let escrow_token = if is_bid { quote_token } else { base_token };
+                let non_escrow_token = if is_bid { base_token } else { quote_token };
+                exchange.set_balance(alice, escrow_token, internal_balance_amount)?;
+
+                let token_to_pause = if pause_escrow_side {
+                    escrow_token
+                } else {
+                    non_escrow_token
+                };
+                let mut tip20 = TIP20Token::from_address(token_to_pause)?;
+                tip20.grant_role_internal(admin, *PAUSE_ROLE)?;
+                tip20.pause(admin, ITIP20::pauseCall {})?;
+
+                let next_order_id_before = exchange.next_order_id()?;
+                let escrow_balance_before = exchange.balance_of(alice, escrow_token)?;
+                let res = place_order(&mut exchange, alice, base_token, amount);
+
+                // Pre-T4: succeeds iff there's a debit path that doesn't touch the paused token.
+                // - escrow paused: only the internal-only fast path avoids it (requires
+                //   balance >= amount)
+                // - non-escrow paused: escrow itself is unpaused, so any debit path works
+                // T4: rejected regardless.
+                let should_succeed =
+                    !spec.is_t4() && (!pause_escrow_side || internal_balance_amount >= amount);
+
+                if should_succeed {
+                    let order_id = res?;
+                    assert_eq!(order_id, next_order_id_before);
+                    assert_eq!(exchange.next_order_id()?, next_order_id_before + 1);
+                    assert_eq!(
+                        exchange.balance_of(alice, escrow_token)?,
+                        escrow_balance_before.saturating_sub(amount)
+                    );
+                } else {
+                    assert_eq!(res.unwrap_err(), TIP20Error::contract_paused().into());
+                    assert_eq!(exchange.next_order_id()?, next_order_id_before);
+                    assert_eq!(
+                        exchange.balance_of(alice, escrow_token)?,
+                        escrow_balance_before
+                    );
+                }
+
+                Ok::<_, eyre::Report>(())
+            })?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_place_orders_on_paused_token_respects_internal_balance_path() -> eyre::Result<()> {
+        let partial_internal_balance = MIN_ORDER_AMOUNT - 1;
+
+        // Full internal balance uses the internal-only path pre-T4, but T4 still rejects
+        // paused-token orders.
+        assert_paused_token_order(
+            true,
+            MIN_ORDER_AMOUNT,
+            false,
+            |exchange, alice, base, amount| exchange.place(alice, base, amount, false, 0),
+        )?;
+        assert_paused_token_order(
+            true,
+            MIN_ORDER_AMOUNT,
+            true,
+            |exchange, alice, base, amount| exchange.place(alice, base, amount, true, 0),
+        )?;
+        assert_paused_token_order(
+            true,
+            MIN_ORDER_AMOUNT,
+            false,
+            |exchange, alice, base, amount| {
+                exchange.place_flip(alice, base, amount, false, 100, 0, true)
+            },
+        )?;
+        assert_paused_token_order(
+            true,
+            MIN_ORDER_AMOUNT,
+            true,
+            |exchange, alice, base, amount| {
+                exchange.place_flip(alice, base, amount, true, 0, 100, true)
+            },
+        )?;
+
+        // Partial internal balance: the fallback transferFrom hits the paused escrow token and
+        // fails on both T3 and T4 without consuming the partial balance.
+        assert_paused_token_order(
+            true,
+            partial_internal_balance,
+            false,
+            |exchange, alice, base, amount| exchange.place(alice, base, amount, false, 0),
+        )?;
+        assert_paused_token_order(
+            true,
+            partial_internal_balance,
+            true,
+            |exchange, alice, base, amount| exchange.place(alice, base, amount, true, 0),
+        )?;
+        assert_paused_token_order(
+            true,
+            partial_internal_balance,
+            false,
+            |exchange, alice, base, amount| {
+                exchange.place_flip(alice, base, amount, false, 100, 0, false)
+            },
+        )?;
+        assert_paused_token_order(
+            true,
+            partial_internal_balance,
+            true,
+            |exchange, alice, base, amount| {
+                exchange.place_flip(alice, base, amount, true, 0, 100, false)
+            },
+        )
+    }
+
+    #[test]
+    fn test_place_orders_on_paused_non_escrow_token_blocked_on_t4() -> eyre::Result<()> {
+        // place: ask + bid (transferFrom path, escrow is unpaused so this succeeds pre-T4)
+        assert_paused_token_order(false, 0, false, |exchange, alice, base, amount| {
+            exchange.place(alice, base, amount, false, 0)
+        })?;
+        assert_paused_token_order(false, 0, true, |exchange, alice, base, amount| {
+            exchange.place(alice, base, amount, true, 0)
+        })?;
+
+        // place_flip non-internal-only: ask + bid
+        assert_paused_token_order(false, 0, false, |exchange, alice, base, amount| {
+            exchange.place_flip(alice, base, amount, false, 100, 0, false)
+        })?;
+        assert_paused_token_order(false, 0, true, |exchange, alice, base, amount| {
+            exchange.place_flip(alice, base, amount, true, 0, 100, false)
+        })?;
+
+        // place_flip internal-only: ask + bid (requires escrow internal balance)
+        assert_paused_token_order(
+            false,
+            MIN_ORDER_AMOUNT,
+            false,
+            |exchange, alice, base, amount| {
+                exchange.place_flip(alice, base, amount, false, 100, 0, true)
+            },
+        )?;
+        assert_paused_token_order(
+            false,
+            MIN_ORDER_AMOUNT,
+            true,
+            |exchange, alice, base, amount| {
+                exchange.place_flip(alice, base, amount, true, 0, 100, true)
+            },
+        )
     }
 
     #[test]
