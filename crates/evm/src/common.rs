@@ -402,6 +402,15 @@ where
         Ok(())
     }
 
+    fn with_warm_caller_info(
+        &mut self,
+        address: Address,
+        f: &mut dyn FnMut(&AccountInfo),
+    ) -> TempoResult<()> {
+        // Read-only context charges no gas and tracks no warm set, so every read is already free.
+        self.with_account_info(address, f)
+    }
+
     // No-op methods are unimplemented in read-only context.
     fn chain_id(&self) -> u64 {
         unreachable!("'chain_id' not implemented in read-only context yet")
