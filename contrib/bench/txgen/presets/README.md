@@ -115,6 +115,14 @@ shared; the preset header lists the details. For example:
 An instance may override template weights (`weights: {card_settlement: 0, card_spend: 13}`),
 merged over `neobank-generic`'s before renormalising; zero drops a template. `neobank/instances-pipeline.yml`
 holds the pipeline's flows and `instances-pipeline-plain-cards.yml` the same with plain card swipes.
+`TXGEN_NEOBANK_INSTANCES` also takes a deployment-shapes file (`shapes/`): a shared description of a
+customer deployment (pillar, flows and the templates behind them, monthly volume, peak factor) that
+`neobank-multi` turns into one instance per shape. `shapes/README.md` documents the format and
+`shapes/examples.yml` holds one shape per pillar.
+\`projected-pipeline\` is \`neobank-multi\` over \`shapes/pipeline.yml\`: the planning sheet's customer
+pipeline aggregated into the four pillars (gas shares from measured gas per transaction). Run it at a
+projected peak-minute rate, not maximum load (the file lists Year 1 and Year 2 rates), to see whether
+the chain sustains that traffic: for example \`derek bench preset=projected-pipeline tps=86\`.
 CI renders the spec with bench-env's `TXGEN_*` assignments, for example
 `derek bench preset=neobank-multi bench-env="TXGEN_NEOBANK_INSTANCES=contrib/bench/txgen/presets/neobank/instances-pipeline.yml"`.
 
