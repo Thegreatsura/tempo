@@ -20,10 +20,16 @@ use p256::ecdsa::SigningKey;
 use reth_e2e_test_utils::wallet::test_signer;
 use reth_tracing::init_test_tracing;
 use serde_json::{Value, from_str, json, to_string};
-use tempo_alloy::{TempoNetwork, rpc::TempoTransactionReceipt};
+use tempo_alloy::{
+    TempoNetwork,
+    rpc::{
+        ConfigurableAccountSimulationApproval, ConfigurableAccountSimulationSpec,
+        PrimitiveSignatureType, TempoTransactionReceipt, TempoTransactionRequest,
+    },
+};
 use tempo_chainspec::hardfork::TempoHardfork;
 use tempo_contracts::precompiles::{
-    CONFIGURABLE_ACCOUNT_ADDRESS, DEFAULT_FEE_TOKEN, IConfigurableAccount,
+    CONFIGURABLE_ACCOUNT_ADDRESS, DEFAULT_FEE_TOKEN, IConfigurableAccount, ITIP20,
 };
 use tempo_evm::{TempoInvalidTransaction, transaction_error::RootKeyRole};
 use tempo_primitives::{
@@ -109,6 +115,35 @@ impl ConfigurableAccount {
 
     fn transaction(&self, env: &Localnet, calls: Vec<Call>) -> TempoTransaction {
         create_basic_aa_tx(env.chain_id(), self.nonce, calls, GAS_LIMIT)
+    }
+
+    fn simulation_request(&self) -> TempoTransactionRequest {
+        TempoTransactionRequest {
+            inner: call_request(
+                self.address,
+                IConfigurableAccount::getConfigCommitmentCall {
+                    account: self.address,
+                }
+                .abi_encode()
+                .into(),
+            ),
+            fee_token: Some(DEFAULT_FEE_TOKEN),
+            configurable_account_simulation: Some(ConfigurableAccountSimulationSpec {
+                signer: None,
+                config: self.config.clone(),
+                approvals: self
+                    .config
+                    .owners
+                    .iter()
+                    .map(|owner| ConfigurableAccountSimulationApproval {
+                        owner: owner.owner,
+                        key_type: None,
+                        key_data: None,
+                    })
+                    .collect(),
+            }),
+            ..Default::default()
+        }
     }
 
     fn quorum(
@@ -306,7 +341,14 @@ async fn commitment(env: &Localnet, account: Address) -> eyre::Result<B256> {
     )
 }
 
-/// Typed Tempo view of the node's RPC, which can carry AA receipts.
+async fn fee_balance(env: &Localnet, account: Address) -> eyre::Result<U256> {
+    Ok(ITIP20::new(DEFAULT_FEE_TOKEN, env.provider())
+        .balanceOf(account)
+        .call()
+        .await?)
+}
+
+/// Typed Tempo view of the node's RPC, which can carry the simulation fields and AA receipts.
 fn tempo_provider(env: &Localnet) -> RootProvider<TempoNetwork> {
     RootProvider::new_http(env.setup.node.rpc_url())
 }
